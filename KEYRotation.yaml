@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Access Key Rotation Lambda with S3 and Secrets Manager'
+
+Resources:
+  # S3 Bucket for storing credential CSVs
+  RotationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: bpay-user-rotation
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldCredentials
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # IAM Role for Lambda
+  KeyRotationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: KeyRotationLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: KeyRotationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # IAM Permissions
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAccessKeys
+                  - iam:CreateAccessKey
+                  - iam:UpdateAccessKey
+                  - iam:DeleteAccessKey
+                Resource: '*'
+              
+              # S3 Permissions
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${RotationBucket.Arn}/*'
+              
+              # Secrets Manager Permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:aws-access-key/*'
+
+  # Lambda Function
+  KeyRotationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AccessKeyRotationFunction
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt KeyRotationLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: bpay-user-rotation
+          ROTATION_DAYS: '90'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import csv
+          from datetime import datetime, timezone
+          from io import StringIO
+          from botocore.exceptions import ClientError
+
+          # Initialize AWS clients
+          iam = boto3.client('iam')
+          s3 = boto3.client('s3')
+          secretsmanager = boto3.client('secretsmanager')
+
+          BUCKET_NAME = 'bpay-user-rotation'
+          ROTATION_DAYS = 90
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to rotate AWS access keys every 90 days
+              Stores credentials in S3 and Secrets Manager
+              """
+              try:
+                  # Get all IAM users
+                  users = get_all_users()
+                  
+                  rotation_results = []
+                  
+                  for user in users:
+                      username = user['UserName']
+                      print(f"Processing user: {username}")
+                      
+                      # Get user's access keys
+                      keys = get_user_access_keys(username)
+                      
+                      if not keys:
+                          print(f"No keys found for {username}")
+                          continue
+                      
+                      # Check if any keys need rotation
+                      keys_to_rotate = []
+                      for key in keys:
+                          age_days = (datetime.now(timezone.utc) - key['CreateDate']).days
+                          if age_days >= ROTATION_DAYS:
+                              keys_to_rotate.append({
+                                  'AccessKeyId': key['AccessKeyId'],
+                                  'Age': age_days
+                              })
+                      
+                      if keys_to_rotate:
+                          result = rotate_user_keys(username, keys_to_rotate)
+                          rotation_results.append(result)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Key rotation completed',
+                          'rotations': rotation_results
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in lambda_handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def get_all_users():
+              """Get all IAM users"""
+              try:
+                  paginator = iam.get_paginator('list_users')
+                  users = []
+                  for response in paginator.paginate():
+                      users.extend(response['Users'])
+                  return users
+              except ClientError as e:
+                  print(f"Error getting users: {e}")
+                  return []
+
+          def get_user_access_keys(username):
+              """Get all access keys for a user"""
+              try:
+                  response = iam.list_access_keys(UserName=username)
+                  return response['AccessKeyMetadata']
+              except ClientError as e:
+                  print(f"Error retrieving keys for {username}: {e}")
+                  return []
+
+          def rotate_user_keys(username, old_keys):
+              """Rotate keys for a user"""
+              try:
+                  print(f"Rotating keys for {username}")
+                  
+                  # Create new access key
+                  response = iam.create_access_key(UserName=username)
+                  new_key = response['AccessKey']
+                  
+                  access_key_id = new_key['AccessKeyId']
+                  secret_access_key = new_key['SecretAccessKey']
+                  timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+                  
+                  # Prepare credentials data
+                  credentials = {
+                      'UserName': username,
+                      'AccessKeyId': access_key_id,
+                      'SecretAccessKey': secret_access_key,
+                      'CreateDate': datetime.now(timezone.utc).isoformat(),
+                      'OldKeys': [key['AccessKeyId'] for key in old_keys]
+                  }
+                  
+                  # 1. Store in Secrets Manager
+                  store_in_secrets_manager(username, credentials)
+                  
+                  # 2. Create CSV and upload to S3
+                  csv_content = create_csv(credentials)
+                  upload_to_s3(username, csv_content, timestamp)
+                  
+                  # 3. Deactivate old keys (don't delete yet for safety)
+                  for old_key in old_keys:
+                      deactivate_key(username, old_key['AccessKeyId'])
+                  
+                  return {
+                      'username': username,
+                      'new_key_id': access_key_id,
+                      'old_keys_deactivated': [key['AccessKeyId'] for key in old_keys],
+                      'status': 'success',
+                      'timestamp': timestamp
+                  }
+                  
+              except Exception as e:
+                  print(f"Error rotating keys for {username}: {str(e)}")
+                  return {
+                      'username': username,
+                      'status': 'failed',
+                      'error': str(e)
+                  }
+
+          def store_in_secrets_manager(username, credentials):
+              """Store credentials in AWS Secrets Manager"""
+              secret_name = f"aws-access-key/{username}"
+              
+              try:
+                  # Try to create new secret
+                  secretsmanager.create_secret(
+                      Name=secret_name,
+                      Description=f'Access key for IAM user {username}',
+                      SecretString=json.dumps({
+                          'AccessKeyId': credentials['AccessKeyId'],
+                          'SecretAccessKey': credentials['SecretAccessKey'],
+                          'CreateDate': credentials['CreateDate']
+                      })
+                  )
+                  print(f"Created secret: {secret_name}")
+              except secretsmanager.exceptions.ResourceExistsException:
+                  # Secret exists, update it
+                  secretsmanager.update_secret(
+                      SecretId=secret_name,
+                      SecretString=json.dumps({
+                          'AccessKeyId': credentials['AccessKeyId'],
+                          'SecretAccessKey': credentials['SecretAccessKey'],
+                          'CreateDate': credentials['CreateDate']
+                      })
+                  )
+                  print(f"Updated secret: {secret_name}")
+              except Exception as e:
+                  print(f"Error storing in Secrets Manager: {str(e)}")
+                  raise
+
+          def create_csv(credentials):
+              """Create CSV content from credentials"""
+              output = StringIO()
+              writer = csv.writer(output)
+              
+              # Write header
+              writer.writerow(['User Name', 'Access Key ID', 'Secret Access Key', 'Create Date'])
+              
+              # Write data
+              writer.writerow([
+                  credentials['UserName'],
+                  credentials['AccessKeyId'],
+                  credentials['SecretAccessKey'],
+                  credentials['CreateDate']
+              ])
+              
+              return output.getvalue()
+
+          def upload_to_s3(username, csv_content, timestamp):
+              """Upload CSV to S3 in user-specific folder"""
+              # Create folder structure: username/credentials_YYYYMMDD_HHMMSS.csv
+              s3_key = f"{username}/credentials_{timestamp}.csv"
+              
+              try:
+                  s3.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=s3_key,
+                      Body=csv_content,
+                      ContentType='text/csv',
+                      ServerSideEncryption='AES256'
+                  )
+                  print(f"Uploaded to S3: s3://{BUCKET_NAME}/{s3_key}")
+              except Exception as e:
+                  print(f"Error uploading to S3: {str(e)}")
+                  raise
+
+          def deactivate_key(username, access_key_id):
+              """Deactivate an access key"""
+              try:
+                  iam.update_access_key(
+                      UserName=username,
+                      AccessKeyId=access_key_id,
+                      Status='Inactive'
+                  )
+                  print(f"Deactivated key {access_key_id} for {username}")
+              except ClientError as e:
+                  print(f"Error deactivating key: {e}")
+
+  # EventBridge Rule to trigger every 90 days
+  KeyRotationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: AccessKeyRotationSchedule
+      Description: Triggers key rotation every 90 days
+      ScheduleExpression: rate(90 days)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KeyRotationLambda.Arn
+          Id: KeyRotationLambdaTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref KeyRotationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KeyRotationSchedule.Arn
+
+  # SNS Topic for notifications (optional)
+  RotationNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: AccessKeyRotationNotifications
+      DisplayName: Access Key Rotation Notifications
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket for storing credentials
+    Value: !Ref RotationBucket
+  
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt KeyRotationLambda.Arn
+  
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref RotationNotificationTopic
