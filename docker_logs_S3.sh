@@ -9,8 +9,8 @@
 # ===== CONFIGURATION - EDIT THESE =====
 S3_BUCKET="docker-app-logs-staging"
 AWS_REGION="eu-west-2"
-AWS_ACCESS_KEY_ID="AKIASU566HMVP3DHJ3ON"
-AWS_SECRET_ACCESS_KEY="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"
+AWS_ACCESS_KEY_ID="xxxx"
+AWS_SECRET_ACCESS_KEY="xxxx/Z+"
 LOG_DAYS=7                                # Number of days of logs to upload (set to "all" for everything)
 DELETE_AFTER_UPLOAD="true"                # Delete Docker logs after successful upload (true/false)
 # ======================================
