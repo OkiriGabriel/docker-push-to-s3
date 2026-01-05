@@ -7,13 +7,31 @@
 #########################################
 
 # ===== CONFIGURATION - EDIT THESE =====
-S3_BUCKET="docker-app-logs-staging"
-AWS_REGION="eu-west-2"
-AWS_ACCESS_KEY_ID="xxxx"
-AWS_SECRET_ACCESS_KEY="xxxx/Z+"
+S3_BUCKET="${S3_BUCKET:-docker-app-logs-staging}"
+AWS_REGION="${AWS_REGION:-eu-west-2}"
 LOG_DAYS=7                                # Number of days of logs to upload (set to "all" for everything)
 DELETE_AFTER_UPLOAD="true"                # Delete Docker logs after successful upload (true/false)
 # ======================================
+
+# AWS credentials should be set as environment variables before running this script
+# Example: export AWS_ACCESS_KEY_ID="your-key-id"
+#          export AWS_SECRET_ACCESS_KEY="your-secret-key"
+#          export AWS_REGION="eu-west-2" (optional, defaults to eu-west-2)
+
+# Validate that AWS credentials are set
+if [ -z "${AWS_ACCESS_KEY_ID}" ]; then
+    echo "✗ ERROR: AWS_ACCESS_KEY_ID environment variable is not set"
+    echo "   Please set it before running this script:"
+    echo "   export AWS_ACCESS_KEY_ID=\"your-access-key-id\""
+    exit 1
+fi
+
+if [ -z "${AWS_SECRET_ACCESS_KEY}" ]; then
+    echo "✗ ERROR: AWS_SECRET_ACCESS_KEY environment variable is not set"
+    echo "   Please set it before running this script:"
+    echo "   export AWS_SECRET_ACCESS_KEY=\"your-secret-access-key\""
+    exit 1
+fi
 
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
